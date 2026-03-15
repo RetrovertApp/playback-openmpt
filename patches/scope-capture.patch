@@ -1,0 +1,297 @@
+--- a/soundlib/Snd_defs.h	2025-08-31 17:10:41.000000000 +0200
++++ b/soundlib/Snd_defs.h	2026-02-17 13:13:37.427010207 +0100
+@@ -15,6 +15,8 @@
+
+ #include "openmpt/base/FlagSet.hpp"
+
++#include <cstring>
++
+
+ OPENMPT_NAMESPACE_BEGIN
+
+@@ -766,4 +768,40 @@
+
+ using OPLPatch = std::array<uint8, 12>;
+
++// Channel scope buffer for audio visualization
++// Ring buffer size must be power of 2 for fast masking
++inline constexpr uint32 SCOPE_BUFFER_SIZE = 2048;
++inline constexpr uint32 SCOPE_BUFFER_MASK = SCOPE_BUFFER_SIZE - 1;
++
++// Per-channel scope buffer for capturing audio waveform data
++struct ChannelScopeBuffer
++{
++	float samples[SCOPE_BUFFER_SIZE];  // Mono samples (post-interpolation, pre-volume)
++	uint32 writeIndex;                  // Current write position
++	mutable uint32 lastSeenWriteIndex;  // For stale detection
++	mutable uint8 staleCount;           // How many reads without new data
++	bool enabled;                       // Whether capture is enabled for this channel
++
++	void Reset()
++	{
++		writeIndex = 0;
++		lastSeenWriteIndex = 0;
++		staleCount = 0;
++		enabled = false;
++		std::memset(samples, 0, sizeof(samples));
++	}
++
++	void Write(float sample)
++	{
++		samples[writeIndex & SCOPE_BUFFER_MASK] = sample;
++		writeIndex++;
++	}
++
++	// Check if new samples have been written since last read
++	bool HasNewData() const
++	{
++		return writeIndex != lastSeenWriteIndex;
++	}
++};
++
+ OPENMPT_NAMESPACE_END
+--- a/soundlib/ModChannel.h	2024-12-21 21:48:51.000000000 +0100
++++ b/soundlib/ModChannel.h	2026-02-17 13:13:42.907082730 +0100
+@@ -16,6 +16,7 @@
+ #include "InstrumentSynth.h"
+ #include "modcommand.h"
+ #include "Paula.h"
++#include "Snd_defs.h"
+ #include "tuningbase.h"
+
+ #include <bitset>
+@@ -146,6 +147,7 @@
+ 	uint8 nTremorCount, nTremorParam;
+ 	uint8 nPatternLoopCount;
+ 	uint8 nLeftVU, nRightVU;
++	ChannelScopeBuffer* scopeBuffer;  // Optional scope buffer for audio visualization (owned by CSoundFile)
+ 	uint8 nActiveMacro;
+ 	uint8 volSlideDownStart;
+ 	FilterMode nFilterMode;
+--- a/soundlib/MixerInterface.h	2024-05-08 08:11:05.000000000 +0200
++++ b/soundlib/MixerInterface.h	2026-02-17 13:14:28.583687219 +0100
+@@ -92,11 +92,37 @@
+ 	SamplePosition smpPos = c.position;            // Fixed-point sample position
+ 	const SamplePosition increment = c.increment;  // Fixed-point sample increment
+
++	// Get scope buffer pointer (may be nullptr if scope capture is disabled)
++	ChannelScopeBuffer* scopeBuffer = c.scopeBuffer;
++
+ 	while(samples--)
+ 	{
+ 		typename Traits::outbuf_t outSample;
+ 		interpolate(outSample, inSample + smpPos.GetInt() * Traits::numChannelsIn, smpPos.GetFract());
+ 		filter(outSample, c);
++
++		// Capture to scope buffer if enabled (mono mix of stereo samples)
++		// At this point (after interpolation/filter, before volume mix), samples are in roughly
++		// 16-bit range (±32768). Volume is applied in mix() as: outBuffer += outSample * vol
++		// where vol is 0-4096 (12 bits). Full scale = 32768 * 4096 = 134217728 (MIXING_SCALEF).
++		// We apply 5x boost since samples/volumes in typical MOD files rarely hit full scale.
++		if(scopeBuffer)
++		{
++			float scopeSample;
++			constexpr float normalize = 5.0f / 134217728.0f;  // 5x boost for visibility
++			// Use average of left/right volume for mono scope
++			int32 vol = (c.leftVol + c.rightVol) / 2;
++			if constexpr (Traits::numChannelsIn == 1)
++			{
++				scopeSample = static_cast<float>(outSample[0]) * vol * normalize;
++			}
++			else
++			{
++				// For stereo samples, average L+R
++				scopeSample = (static_cast<float>(outSample[0]) + static_cast<float>(outSample[1])) * 0.5f * vol * normalize;
++			}
++			scopeBuffer->Write(scopeSample);
++		}
+ 		mix(outSample, c, outBuffer);
+ 		outBuffer += Traits::numChannelsOut;
+
+--- a/soundlib/Sndfile.h	2025-07-12 23:07:46.000000000 +0200
++++ b/soundlib/Sndfile.h	2026-02-17 13:14:40.631851300 +0100
+@@ -443,6 +443,10 @@
+ 	float MixFloatBuffer[2][MIXBUFFERSIZE];
+ 	mixsample_t MixInputBuffer[NUMMIXINPUTBUFFERS][MIXBUFFERSIZE];
+
++	// Scope buffers for per-channel audio visualization
++	ChannelScopeBuffer m_ScopeBuffers[MAX_CHANNELS];
++	bool m_bScopeEnabled = false;
++
+ 	// End-of-sample pop reduction tail level
+ 	mixsample_t m_dryLOfsVol = 0, m_dryROfsVol = 0;
+ 	mixsample_t m_surroundLOfsVol = 0, m_surroundROfsVol = 0;
+@@ -755,6 +759,11 @@
+ 	void DontLoopPattern(PATTERNINDEX nPat, ROWINDEX nRow = 0);
+ 	CHANNELINDEX GetMixStat() const { return m_nMixStat; }
+ 	void ResetMixStat() { m_nMixStat = 0; }
++	// Scope buffer methods for per-channel audio visualization
++	void EnableScopeCapture(bool enable);
++	bool IsScopeCaptureEnabled() const { return m_bScopeEnabled; }
++	const ChannelScopeBuffer* GetChannelScopeBuffer(CHANNELINDEX channel) const;
++	std::size_t GetChannelScopeData(CHANNELINDEX channel, float* outBuffer, std::size_t numSamples) const;
+ 	void ResetPlayPos();
+ 	void SetCurrentOrder(ORDERINDEX nOrder);
+ 	std::string GetTitle() const { return m_songName; }
+--- a/soundlib/Sndfile.cpp	2025-11-15 15:03:20.000000000 +0100
++++ b/soundlib/Sndfile.cpp	2026-02-17 13:14:58.132092079 +0100
+@@ -942,6 +942,72 @@
+
+
+
++
++void CSoundFile::EnableScopeCapture(bool enable)
++{
++	m_bScopeEnabled = enable;
++	for(CHANNELINDEX i = 0; i < MAX_CHANNELS; i++)
++	{
++		m_ScopeBuffers[i].enabled = enable;
++		if(enable)
++		{
++			m_ScopeBuffers[i].Reset();
++		}
++		// Link channel to its scope buffer
++		if(i < m_PlayState.Chn.size())
++		{
++			m_PlayState.Chn[i].scopeBuffer = enable ? &m_ScopeBuffers[i] : nullptr;
++		}
++	}
++}
++
++const ChannelScopeBuffer *CSoundFile::GetChannelScopeBuffer(CHANNELINDEX channel) const
++{
++	if(channel >= MAX_CHANNELS || !m_bScopeEnabled)
++	{
++		return nullptr;
++	}
++	return &m_ScopeBuffers[channel];
++}
++
++std::size_t CSoundFile::GetChannelScopeData(CHANNELINDEX channel, float *outBuffer, std::size_t numSamples) const
++{
++	if(channel >= MAX_CHANNELS || !m_bScopeEnabled || outBuffer == nullptr || numSamples == 0)
++	{
++		return 0;
++	}
++
++	ChannelScopeBuffer &scope = const_cast<ChannelScopeBuffer &>(m_ScopeBuffers[channel]);
++	const std::size_t maxSamples = std::min(numSamples, static_cast<std::size_t>(SCOPE_BUFFER_SIZE));
++
++	// Track staleness - if no new data for several reads, clear to silence
++	if(scope.HasNewData())
++	{
++		scope.staleCount = 0;
++		scope.lastSeenWriteIndex = scope.writeIndex;
++	}
++	else
++	{
++		scope.staleCount++;
++		// After ~5 frames without new data, return silence to avoid stuck waveforms
++		if(scope.staleCount > 5)
++		{
++			std::memset(outBuffer, 0, maxSamples * sizeof(float));
++			return maxSamples;
++		}
++	}
++
++	// Read the most recent samples from the ring buffer
++	uint32 readIndex = scope.writeIndex - static_cast<uint32>(maxSamples);
++	for(std::size_t i = 0; i < maxSamples; i++)
++	{
++		outBuffer[i] = scope.samples[readIndex & SCOPE_BUFFER_MASK];
++		readIndex++;
++	}
++
++	return maxSamples;
++}
++
+ void CSoundFile::SetCurrentOrder(ORDERINDEX nOrder)
+ {
+ 	while(nOrder < Order().size() && !Order().IsValidPat(nOrder))
+--- a/libopenmpt/libopenmpt_impl.hpp	2024-10-20 14:00:52.000000000 +0200
++++ b/libopenmpt/libopenmpt_impl.hpp	2026-02-17 13:15:24.188450078 +0100
+@@ -275,6 +275,9 @@
+ 	void ctl_set_integer( std::string_view ctl, std::int64_t value, bool throw_if_unknown = true );
+ 	void ctl_set_floatingpoint( std::string_view ctl, double value, bool throw_if_unknown = true );
+ 	void ctl_set_text( std::string_view ctl, std::string_view value, bool throw_if_unknown = true );
++	void enable_scope_capture( bool enable );
++	bool is_scope_capture_enabled() const;
++	std::size_t get_channel_scope_data( std::int32_t channel, float * buffer, std::size_t num_samples ) const;
+ }; // class module_impl
+
+ namespace helper {
+--- a/libopenmpt/libopenmpt_impl.cpp	2024-10-20 14:00:52.000000000 +0200
++++ b/libopenmpt/libopenmpt_impl.cpp	2026-02-17 18:30:00.000000000 +0100
+@@ -2216,4 +2216,14 @@
+ 	}
+ }
+
++void module_impl::enable_scope_capture( bool enable ) {
++	m_sndFile->EnableScopeCapture( enable );
++}
++bool module_impl::is_scope_capture_enabled() const {
++	return m_sndFile->IsScopeCaptureEnabled();
++}
++std::size_t module_impl::get_channel_scope_data( std::int32_t channel, float * buffer, std::size_t num_samples ) const {
++	return m_sndFile->GetChannelScopeData( static_cast<OpenMPT::CHANNELINDEX>( channel ), buffer, num_samples );
++}
++
+ } // namespace openmpt
+--- a/libopenmpt/libopenmpt.hpp	2024-12-27 10:36:49.000000000 +0100
++++ b/libopenmpt/libopenmpt.hpp	2026-02-17 13:15:24.188450078 +0100
+@@ -1263,6 +1263,35 @@
+ 	*/
+ 	LIBOPENMPT_CXX_API_MEMBER void ctl_set_text( std::string_view ctl, std::string_view value );
+
++	//! Enable or disable per-channel audio scope capture.
++	/*!
++	  \param enable Set to true to enable scope capture, false to disable.
++	  \remarks When enabled, audio samples are captured to per-channel ring buffers during mixing.
++	           This enables audio visualization (oscilloscopes, spectrum analyzers) for individual channels.
++	           There is a small performance overhead when scope capture is enabled.
++	  \sa openmpt::module::get_channel_scope_data
++	*/
++	LIBOPENMPT_CXX_API_MEMBER void enable_scope_capture( bool enable );
++	//! Check if per-channel audio scope capture is enabled.
++	/*!
++	  \return True if scope capture is enabled, false otherwise.
++	  \sa openmpt::module::enable_scope_capture
++	*/
++	LIBOPENMPT_CXX_API_MEMBER bool is_scope_capture_enabled() const;
++	//! Get per-channel audio scope data for visualization.
++	/*!
++	  \param channel The channel whose audio data should be retrieved.
++	  \param buffer Pointer to a float buffer where samples will be written.
++	  \param num_samples The maximum number of samples to retrieve.
++	  \return The actual number of samples written to the buffer (may be less than num_samples).
++	  \remarks The returned samples are the raw audio waveform (post-interpolation, pre-volume mixing)
++	           captured during the most recent call to read() / read_interleaved_stereo() etc.
++	           The samples are normalized to approximately [-1.0, 1.0] range.
++	           Maximum retrievable samples is 2048 (the ring buffer size).
++	  \sa openmpt::module::enable_scope_capture
++	*/
++	LIBOPENMPT_CXX_API_MEMBER std::size_t get_channel_scope_data( std::int32_t channel, float * buffer, std::size_t num_samples ) const;
++
+ 	// remember to add new functions to both C and C++ interfaces and to increase OPENMPT_API_VERSION_MINOR
+
+ }; // class module
+--- a/libopenmpt/libopenmpt_cxx.cpp	2024-10-20 14:00:52.000000000 +0200
++++ b/libopenmpt/libopenmpt_cxx.cpp	2026-02-17 13:15:24.188450078 +0100
+@@ -480,6 +480,17 @@
+ 	impl->ctl_set_text( ctl, value );
+ }
+
++
++void module::enable_scope_capture( bool enable ) {
++	impl->enable_scope_capture( enable );
++}
++bool module::is_scope_capture_enabled() const {
++	return impl->is_scope_capture_enabled();
++}
++std::size_t module::get_channel_scope_data( std::int32_t channel, float * buffer, std::size_t num_samples ) const {
++	return impl->get_channel_scope_data( channel, buffer, num_samples );
++}
++
+ module_ext::module_ext( std::istream & stream, std::ostream & log, const std::map< std::string, std::string > & ctls ) : ext_impl(0) {
+ 	ext_impl = new module_ext_impl( stream, openmpt::helper::make_unique<std_ostream_log>( log ), ctls );
+ 	set_impl( ext_impl );
