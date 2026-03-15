@@ -3,11 +3,10 @@
 # Decodes tracker music formats (MOD, XM, S3M, IT, etc.) using libopenmpt.
 
 cmake_minimum_required(VERSION 3.16)
+project(playback_openmpt C CXX)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(PlaybackPlugin)
-
-enable_language(CXX)
 
 # Download libopenmpt 0.8.4 (with scope capture patch for audio visualization)
 download_library(
