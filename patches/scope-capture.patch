@@ -1,18 +1,18 @@
 --- a/soundlib/Snd_defs.h	2025-08-31 17:10:41.000000000 +0200
 +++ b/soundlib/Snd_defs.h	2026-02-17 13:13:37.427010207 +0100
 @@ -15,6 +15,8 @@
-
+ 
  #include "openmpt/base/FlagSet.hpp"
-
+ 
 +#include <cstring>
 +
-
+ 
  OPENMPT_NAMESPACE_BEGIN
-
+ 
 @@ -766,4 +768,40 @@
-
+ 
  using OPLPatch = std::array<uint8, 12>;
-
+ 
 +// Channel scope buffer for audio visualization
 +// Ring buffer size must be power of 2 for fast masking
 +inline constexpr uint32 SCOPE_BUFFER_SIZE = 2048;
@@ -58,7 +58,7 @@
  #include "Paula.h"
 +#include "Snd_defs.h"
  #include "tuningbase.h"
-
+ 
  #include <bitset>
 @@ -146,6 +147,7 @@
  	uint8 nTremorCount, nTremorParam;
@@ -73,7 +73,7 @@
 @@ -92,11 +92,37 @@
  	SamplePosition smpPos = c.position;            // Fixed-point sample position
  	const SamplePosition increment = c.increment;  // Fixed-point sample increment
-
+ 
 +	// Get scope buffer pointer (may be nullptr if scope capture is disabled)
 +	ChannelScopeBuffer* scopeBuffer = c.scopeBuffer;
 +
@@ -107,13 +107,13 @@
 +		}
  		mix(outSample, c, outBuffer);
  		outBuffer += Traits::numChannelsOut;
-
+ 
 --- a/soundlib/Sndfile.h	2025-07-12 23:07:46.000000000 +0200
 +++ b/soundlib/Sndfile.h	2026-02-17 13:14:40.631851300 +0100
 @@ -443,6 +443,10 @@
  	float MixFloatBuffer[2][MIXBUFFERSIZE];
  	mixsample_t MixInputBuffer[NUMMIXINPUTBUFFERS][MIXBUFFERSIZE];
-
+ 
 +	// Scope buffers for per-channel audio visualization
 +	ChannelScopeBuffer m_ScopeBuffers[MAX_CHANNELS];
 +	bool m_bScopeEnabled = false;
@@ -136,9 +136,9 @@
 --- a/soundlib/Sndfile.cpp	2025-11-15 15:03:20.000000000 +0100
 +++ b/soundlib/Sndfile.cpp	2026-02-17 13:14:58.132092079 +0100
 @@ -942,6 +942,72 @@
-
-
-
+ 
+ 
+ 
 +
 +void CSoundFile::EnableScopeCapture(bool enable)
 +{
@@ -218,14 +218,14 @@
 +	bool is_scope_capture_enabled() const;
 +	std::size_t get_channel_scope_data( std::int32_t channel, float * buffer, std::size_t num_samples ) const;
  }; // class module_impl
-
+ 
  namespace helper {
 --- a/libopenmpt/libopenmpt_impl.cpp	2024-10-20 14:00:52.000000000 +0200
 +++ b/libopenmpt/libopenmpt_impl.cpp	2026-02-17 18:30:00.000000000 +0100
 @@ -2216,4 +2216,14 @@
  	}
  }
-
+ 
 +void module_impl::enable_scope_capture( bool enable ) {
 +	m_sndFile->EnableScopeCapture( enable );
 +}
@@ -242,7 +242,7 @@
 @@ -1263,6 +1263,35 @@
  	*/
  	LIBOPENMPT_CXX_API_MEMBER void ctl_set_text( std::string_view ctl, std::string_view value );
-
+ 
 +	//! Enable or disable per-channel audio scope capture.
 +	/*!
 +	  \param enable Set to true to enable scope capture, false to disable.
@@ -273,14 +273,14 @@
 +	LIBOPENMPT_CXX_API_MEMBER std::size_t get_channel_scope_data( std::int32_t channel, float * buffer, std::size_t num_samples ) const;
 +
  	// remember to add new functions to both C and C++ interfaces and to increase OPENMPT_API_VERSION_MINOR
-
+ 
  }; // class module
 --- a/libopenmpt/libopenmpt_cxx.cpp	2024-10-20 14:00:52.000000000 +0200
 +++ b/libopenmpt/libopenmpt_cxx.cpp	2026-02-17 13:15:24.188450078 +0100
 @@ -480,6 +480,17 @@
  	impl->ctl_set_text( ctl, value );
  }
-
+ 
 +
 +void module::enable_scope_capture( bool enable ) {
 +	impl->enable_scope_capture( enable );
