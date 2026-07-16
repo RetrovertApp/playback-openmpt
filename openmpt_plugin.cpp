@@ -496,116 +496,155 @@ static RVSettingsUpdate openmpt_settings_updated(void* user_data, const RVServic
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static int openmpt_get_tracker_info(void* user_data, RVTrackerInfo* info) {
+static const openmpt::module::command_index s_cmds[5] = {
+    openmpt::module::command_index::command_note,
+    openmpt::module::command_index::command_instrument,
+    openmpt::module::command_index::command_volume,
+    openmpt::module::command_index::command_effect,
+    openmpt::module::command_index::command_parameter,
+};
+
+static bool openmpt_get_structure(void* user_data, RVVizInfo* out) {
     OpenMptData* data = (OpenMptData*)user_data;
-    if (data == nullptr || data->mod == nullptr || info == nullptr) {
-        return -1;
-    }
-
-    memset(info, 0, sizeof(*info));
-
-    openmpt::module* mod = data->mod;
-
-    info->num_patterns = (uint16_t)mod->get_num_patterns();
-    info->num_channels = (uint16_t)mod->get_num_channels();
-    info->num_orders = (uint16_t)mod->get_num_orders();
-    info->num_samples = (uint16_t)mod->get_num_samples();
-    info->current_pattern = (uint16_t)mod->get_current_pattern();
-    info->current_row = (uint16_t)mod->get_current_row();
-    info->current_order = (uint16_t)mod->get_current_order();
-    info->rows_per_pattern = (uint16_t)mod->get_pattern_num_rows(info->current_pattern);
-
-    // Get song name
-    std::string name = mod->get_metadata("title");
-    strncpy(info->song_name, name.c_str(), sizeof(info->song_name) - 1);
-    info->song_name[sizeof(info->song_name) - 1] = '\0';
-
-    // Get module type (e.g., "mod", "xm", "s3m", "it")
-    std::string type = mod->get_metadata("type");
-    strncpy(info->module_type, type.c_str(), sizeof(info->module_type) - 1);
-    info->module_type[sizeof(info->module_type) - 1] = '\0';
-
-    // Get sample names
-    std::vector<std::string> sample_names = mod->get_sample_names();
-    for (size_t i = 0; i < sample_names.size() && i < 32; i++) {
-        strncpy(info->sample_names[i], sample_names[i].c_str(), sizeof(info->sample_names[i]) - 1);
-        info->sample_names[i][sizeof(info->sample_names[i]) - 1] = '\0';
-    }
-
-    return 0;
+    if (data == nullptr || data->mod == nullptr || out == nullptr)
+        return false;
+    uint32_t ch = (uint32_t)data->mod->get_num_channels();
+    out->caps = RVVizCaps_PatternCells | RVVizCaps_Scope | RVVizCaps_WholeSongKnown;
+    out->scroll_mode = RVScrollMode_Synchronized;
+    out->pattern_channel_count = ch;
+    out->scope_channel_count = ch;
+    out->column_count = 5;
+    return true;
 }
 
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static int openmpt_get_pattern_cell(void* user_data, int pattern, int row, int channel, RVPatternCell* cell) {
-    OpenMptData* data = (OpenMptData*)user_data;
-    if (data == nullptr || data->mod == nullptr || cell == nullptr) {
-        return -1;
+static uint32_t openmpt_get_columns(void* user_data, RVColumnDesc* out, uint32_t cap) {
+    (void)user_data;
+    static const struct {
+        const char* label;
+        uint8_t width;
+        RVColumnKind kind;
+    } cols[5] = {
+        {"Note", 3, RVColumnKind_Note},  {"Inst", 2, RVColumnKind_Instrument}, {"Vol", 3, RVColumnKind_Volume},
+        {"Eff", 1, RVColumnKind_Effect}, {"Prm", 2, RVColumnKind_Param},
+    };
+    uint32_t n = cap < 5 ? cap : 5;
+    for (uint32_t i = 0; i < n; i++) {
+        memset(out[i].label, 0, sizeof(out[i].label));
+        strncpy((char*)out[i].label, cols[i].label, sizeof(out[i].label) - 1);
+        out[i].char_width = cols[i].width;
+        out[i].kind = cols[i].kind;
     }
-
-    openmpt::module* mod = data->mod;
-
-    // Validate indices
-    if (pattern < 0 || pattern >= mod->get_num_patterns()) {
-        return -1;
-    }
-    if (row < 0 || row >= mod->get_pattern_num_rows(pattern)) {
-        return -1;
-    }
-    if (channel < 0 || channel >= mod->get_num_channels()) {
-        return -1;
-    }
-
-    // Get cell data using libopenmpt API
-    cell->note
-        = mod->get_pattern_row_channel_command(pattern, row, channel, openmpt::module::command_index::command_note);
-    cell->instrument = mod->get_pattern_row_channel_command(pattern, row, channel,
-                                                            openmpt::module::command_index::command_instrument);
-    cell->volume
-        = mod->get_pattern_row_channel_command(pattern, row, channel, openmpt::module::command_index::command_volume);
-    // Use format_pattern_row_channel_command for effect to get the correct format-specific letter
-    std::string effect_str = mod->format_pattern_row_channel_command(pattern, row, channel,
-                                                                     openmpt::module::command_index::command_effect);
-    cell->effect = (!effect_str.empty() && effect_str[0] != '.') ? (uint8_t)effect_str[0] : 0;
-    cell->effect_param = mod->get_pattern_row_channel_command(pattern, row, channel,
-                                                              openmpt::module::command_index::command_parameter);
-
-    return 0;
+    return n;
 }
 
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static int openmpt_get_pattern_num_rows(void* user_data, int pattern) {
-    OpenMptData* data = (OpenMptData*)user_data;
-    if (data == nullptr || data->mod == nullptr) {
-        return 0;
+static uint32_t openmpt_fill_channels(OpenMptData* data, RVChannelDesc* out, uint32_t cap) {
+    std::vector<std::string> names = data->mod->get_channel_names();
+    uint32_t count = (uint32_t)names.size();
+    if (count > cap)
+        count = cap;
+    for (uint32_t i = 0; i < count; i++) {
+        memset(out[i].name, 0, sizeof(out[i].name));
+        if (names[i].empty())
+            snprintf((char*)out[i].name, sizeof(out[i].name), "Ch %u", i + 1);
+        else
+            strncpy((char*)out[i].name, names[i].c_str(), sizeof(out[i].name) - 1);
+        out[i].scope_width = 0;
     }
-
-    openmpt::module* mod = data->mod;
-
-    if (pattern < 0 || pattern >= mod->get_num_patterns()) {
-        return 0;
-    }
-
-    return mod->get_pattern_num_rows(pattern);
+    return count;
 }
 
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Scope/Waveform visualization API
-
-static uint32_t openmpt_get_scope_data(void* user_data, int channel, float* buffer, uint32_t num_samples) {
+static uint32_t openmpt_get_pattern_channels(void* user_data, RVChannelDesc* out, uint32_t cap) {
     OpenMptData* data = (OpenMptData*)user_data;
-    if (data == nullptr || data->mod == nullptr || buffer == nullptr) {
+    if (data == nullptr || data->mod == nullptr)
         return 0;
-    }
+    return openmpt_fill_channels(data, out, cap);
+}
 
-    // Auto-enable scope capture on first call
+static uint32_t openmpt_get_scope_channels(void* user_data, RVChannelDesc* out, uint32_t cap) {
+    OpenMptData* data = (OpenMptData*)user_data;
+    if (data == nullptr || data->mod == nullptr)
+        return 0;
+    return openmpt_fill_channels(data, out, cap);
+}
+
+static bool openmpt_get_position(void* user_data, RVTrackerPosition* out) {
+    OpenMptData* data = (OpenMptData*)user_data;
+    if (data == nullptr || data->mod == nullptr || out == nullptr)
+        return false;
+    openmpt::module* mod = data->mod;
+    out->order = (uint32_t)mod->get_current_order();
+    out->pattern = (uint32_t)mod->get_current_pattern();
+    out->row = (uint32_t)mod->get_current_row();
+    out->window_lo = 0;
+    out->window_hi = (uint32_t)mod->get_pattern_num_rows(mod->get_current_pattern());
+    return true;
+}
+
+static uint32_t openmpt_get_channel_rows(void* user_data, uint32_t* out, uint32_t cap) {
+    (void)user_data;
+    (void)out;
+    (void)cap;
+    return 0;  // Synchronized: window comes from get_position
+}
+
+static uint32_t openmpt_get_cells(void* user_data, int32_t channel, uint32_t row_lo, uint32_t row_hi, RVPatternCell* out,
+                                  uint32_t cap) {
+    OpenMptData* data = (OpenMptData*)user_data;
+    if (data == nullptr || data->mod == nullptr || out == nullptr)
+        return 0;
+    openmpt::module* mod = data->mod;
+    int pattern = mod->get_current_pattern();
+    uint32_t num_rows = (uint32_t)mod->get_pattern_num_rows(pattern);
+    int num_ch = mod->get_num_channels();
+    if (row_hi > num_rows)
+        row_hi = num_rows;
+
+    int ch_start = channel < 0 ? 0 : channel;
+    int ch_end = channel < 0 ? num_ch : channel + 1;
+    if (ch_start >= num_ch)
+        return 0;
+
+    uint32_t written = 0;
+    for (uint32_t row = row_lo; row < row_hi; row++) {
+        for (int ch = ch_start; ch < ch_end; ch++) {
+            for (int c = 0; c < 5; c++) {
+                if (written >= cap)
+                    return written;
+                RVPatternCell* cell = &out[written++];
+                cell->raw = mod->get_pattern_row_channel_command(pattern, row, ch, s_cmds[c]);
+                std::string s = mod->format_pattern_row_channel_command(pattern, row, ch, s_cmds[c]);
+                memset(cell->text, 0, sizeof(cell->text));
+                strncpy((char*)cell->text, s.c_str(), sizeof(cell->text) - 1);
+            }
+        }
+    }
+    return written;
+}
+
+static void openmpt_set_scope_enabled(void* user_data, bool on) {
+    OpenMptData* data = (OpenMptData*)user_data;
+    if (data == nullptr || data->mod == nullptr)
+        return;
+    data->mod->enable_scope_capture(on);
+    data->scope_enabled = on;
+}
+
+static uint32_t openmpt_get_scope_samples(void* user_data, int32_t channel, float* out, uint32_t cap) {
+    OpenMptData* data = (OpenMptData*)user_data;
+    if (data == nullptr || data->mod == nullptr || out == nullptr)
+        return 0;
     if (!data->scope_enabled) {
         data->mod->enable_scope_capture(true);
         data->scope_enabled = true;
     }
+    return (uint32_t)data->mod->get_channel_scope_data(channel, out, cap);
+}
 
-    return static_cast<uint32_t>(data->mod->get_channel_scope_data(channel, buffer, num_samples));
+static uint32_t openmpt_get_vu(void* user_data, float* out, uint32_t cap) {
+    (void)user_data;
+    (void)out;
+    (void)cap;
+    return 0;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -619,26 +658,6 @@ static void openmpt_static_init(const RVService* service_api) {
     RVSettings_register_array(g_settings_api, "libopenmpt", s_settings);
 
     rv_info("OpenMPT plugin initialized (libopenmpt %s)", openmpt::string::get("library_version").c_str());
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static uint32_t openmpt_get_scope_channel_names(void* user_data, const char** names, uint32_t max_channels) {
-    OpenMptData* data = static_cast<OpenMptData*>(user_data);
-    if (data == nullptr || data->mod == nullptr)
-        return 0;
-
-    static char s_name_bufs[64][16];
-    uint32_t count = (uint32_t)data->mod->get_num_channels();
-    if (count > 64)
-        count = 64;
-    if (count > max_channels)
-        count = max_channels;
-    for (uint32_t i = 0; i < count; i++) {
-        snprintf(s_name_bufs[i], sizeof(s_name_bufs[i]), "Ch %u", i + 1);
-        names[i] = s_name_bufs[i];
-    }
-    return count;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -660,14 +679,17 @@ static RVPlaybackPlugin s_openmpt_plugin = {
     openmpt_metadata,
     openmpt_static_init,
     openmpt_settings_updated,
-    // Tracker visualization API
-    openmpt_get_tracker_info,
-    openmpt_get_pattern_cell,
-    openmpt_get_pattern_num_rows,
-    // Scope/Waveform visualization API
-    openmpt_get_scope_data,
     nullptr, // static_destroy
-    openmpt_get_scope_channel_names,
+    openmpt_get_structure,
+    openmpt_get_columns,
+    openmpt_get_pattern_channels,
+    openmpt_get_scope_channels,
+    openmpt_get_position,
+    openmpt_get_channel_rows,
+    openmpt_get_cells,
+    openmpt_set_scope_enabled,
+    openmpt_get_scope_samples,
+    openmpt_get_vu,
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
