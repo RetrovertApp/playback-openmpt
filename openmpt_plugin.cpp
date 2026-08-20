@@ -239,9 +239,13 @@ static RVReadInfo openmpt_read_data(void* user_data, RVReadData dest) {
     OpenMptData* replayer_data = (OpenMptData*)user_data;
     uint32_t sample_rate = dest.info.format.sample_rate;
 
-    // Calculate max frames we can generate
-    const int samples_to_generate
+    // Frames are capped by both the buffer capacity and the caller's requested
+    // maximum: the buffer may be larger than the request.
+    int samples_to_generate
         = (int)(dest.channels_output_max_bytes_size / (sizeof(float) * 2)); // stereo interleaved
+    if (dest.info.frame_count != 0 && (int)dest.info.frame_count < samples_to_generate) {
+        samples_to_generate = (int)dest.info.frame_count;
+    }
 
     // Support overriding the default sample rate
     if (replayer_data->sample_rate != 0) {
