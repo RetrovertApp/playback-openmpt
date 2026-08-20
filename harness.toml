@@ -1,0 +1,9 @@
+[plugin]
+name = "openmpt"
+
+[data]
+entries = []
+
+[[fixtures]]
+file = "fixtures/retrovert_selftest.mod"
+sha256 = "13961bdc9ca374edbb0421b108b24791ad0a0417350e9709bd4796e6597fd78b"
